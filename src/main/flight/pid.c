@@ -93,6 +93,9 @@ typedef struct {
     // Used for ANGLE filtering (PT1, we don't need super-sharpness here)
     pt1Filter_t angleFilterState;
 
+    // Add this field to store the accumulated integral error for the angle controller
+    float angleErrorIntegral; 
+
     // Rate filtering
     rateLimitFilter_t axisAccelFilter;
     pt1Filter_t ptermLpfState;
@@ -188,10 +191,10 @@ PG_RESET_TEMPLATE(pidProfile_t, pidProfile,
                 [PID_PITCH] = { SETTING_MC_P_PITCH_DEFAULT, SETTING_MC_I_PITCH_DEFAULT, SETTING_MC_D_PITCH_DEFAULT, SETTING_MC_CD_PITCH_DEFAULT },
                 [PID_YAW] =   { SETTING_MC_P_YAW_DEFAULT, SETTING_MC_I_YAW_DEFAULT, SETTING_MC_D_YAW_DEFAULT, SETTING_MC_CD_YAW_DEFAULT },
                 [PID_LEVEL] = {
-                    .P = SETTING_MC_P_LEVEL_DEFAULT,          // Self-level strength
-                    .I = SETTING_MC_I_LEVEL_DEFAULT,          // Self-leveing low-pass frequency (0 - disabled)
-                    .D = SETTING_MC_D_LEVEL_DEFAULT,          // 75% horizon strength
-                    .FF = 0,
+                    .P = SETTING_MC_P_LEVEL_DEFAULT,          // Self-level P-term
+                    .I = SETTING_MC_I_LEVEL_DEFAULT,          // Self-level I-term
+                    .D = SETTING_MC_D_LEVEL_DEFAULT,          // Self-level D-term (currently used for lpf in hz (0 - disabled))
+                    .FF = 0,                                  // Self-level FF-term (currently not used)
                 },
                 [PID_HEADING] = { SETTING_NAV_MC_HEADING_P_DEFAULT, 0, 0, 0 },
                 [PID_POS_XY] = {
@@ -393,6 +396,7 @@ void pidResetErrorAccumulators(void)
     for (int axis = 0; axis < 3; axis++) {
         pidState[axis].errorGyroIf = 0.0f;
         pidState[axis].errorGyroIfLimit = 0.0f;
+        pidState[axis].angleErrorIntegral = 0.0f;  //added to reset the angle error integral
     }
 }
 
@@ -636,6 +640,8 @@ static float computePidLevelTarget(flight_dynamics_index_t axis) {
 static void pidLevel(const float angleTarget, pidState_t *pidState, flight_dynamics_index_t axis, float horizonRateMagnitude, float dT)
 {
     float angleErrorDeg = DECIDEGREES_TO_DEGREES(angleTarget - attitude.raw[axis]);
+    // Accumulate the integral error
+    pidState->angleErrorIntegral += angleErrorDeg * dT;
 
     // Soaring mode deadband inactive if pitch/roll stick not centered to allow RC stick adjustment
     if (FLIGHT_MODE(SOARING_MODE) && axis == FD_PITCH && calculateRollPitchCenterStatus() == CENTERED) {
@@ -646,7 +652,19 @@ static void pidLevel(const float angleTarget, pidState_t *pidState, flight_dynam
         }
     }
 
-    float angleRateTarget = constrainf(angleErrorDeg * (pidBank()->pid[PID_LEVEL].P * FP_PID_LEVEL_P_MULTIPLIER), -currentControlRateProfile->stabilized.rates[axis] * 10.0f, currentControlRateProfile->stabilized.rates[axis] * 10.0f);
+    // Constrain the integral error to prevent windup
+    //NOTE this may be a dumb limit since it's based on the rate limit.
+    //stabilized.rates[axis] is the rate limit for the axis controlled by roll_rate/pitch_rate in the CLI,
+    //or the Stabilized Rates section of the configurator.
+    float integralLimit = currentControlRateProfile->stabilized.rates[axis] * 10.0f;
+    
+    //added logic elsewhere to reset the i term when the other iterms are reset.  Maybe that was an issue?
+    pidState->angleErrorIntegral = constrainf(pidState->angleErrorIntegral, -integralLimit, integralLimit);
+    float angleRateTarget = constrainf(
+        angleErrorDeg * (pidBank()->pid[PID_LEVEL].P * FP_PID_LEVEL_P_MULTIPLIER) +
+        pidState->angleErrorIntegral * (pidBank()->pid[PID_LEVEL].I * FP_PID_LEVEL_I_MULTIPLIER),
+        -currentControlRateProfile->stabilized.rates[axis] * 10.0f,
+        currentControlRateProfile->stabilized.rates[axis] * 10.0f);
 
     // Apply simple LPF to angleRateTarget to make response less jerky
     // Ideas behind this:
@@ -659,9 +677,10 @@ static void pidLevel(const float angleTarget, pidState_t *pidState, flight_dynam
     //     compensate for each slightest change
     //  5) (2) and (4) lead to a simple idea of adding a low-pass filter on rateTarget for ANGLE mode damping
     //     response to rapid attitude changes and smoothing out self-leveling reaction
-    if (pidBank()->pid[PID_LEVEL].I) {
-        // I8[PIDLEVEL] is filter cutoff frequency (Hz). Practical values of filtering frequency is 5-10 Hz
-        angleRateTarget = pt1FilterApply4(&pidState->angleFilterState, angleRateTarget, pidBank()->pid[PID_LEVEL].I, dT);
+    
+    if (pidBank()->pid[PID_LEVEL].D) {
+        // PIDLEVEL.D is filter cutoff frequency (Hz). Practical values of filtering frequency is 5-10 Hz
+        angleRateTarget = pt1FilterApply4(&pidState->angleFilterState, angleRateTarget, pidBank()->pid[PID_LEVEL].D, dT);
     }
 
     // P[LEVEL] defines self-leveling strength (both for ANGLE and HORIZON modes)
