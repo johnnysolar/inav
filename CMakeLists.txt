@@ -97,3 +97,5 @@ collect_targets()
 
 message("-- Build type: ${CMAKE_BUILD_TYPE}")
 include(ci)
+
+include_directories(${CMAKE_BINARY_DIR}/../src/*)

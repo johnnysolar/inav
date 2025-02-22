@@ -94,7 +94,8 @@ typedef struct {
     pt1Filter_t angleFilterState;
 
     // Add this field to store the accumulated integral error for the angle controller
-    float angleErrorIntegral; 
+    float angleErrorIntegral;
+    pt1Filter_t angleIntegralFilterState;  //smooth the integral error
 
     // Rate filtering
     rateLimitFilter_t axisAccelFilter;
@@ -639,9 +640,10 @@ static float computePidLevelTarget(flight_dynamics_index_t axis) {
 
 static void pidLevel(const float angleTarget, pidState_t *pidState, flight_dynamics_index_t axis, float horizonRateMagnitude, float dT)
 {
+    return;  //just skip it all for now...
     float angleErrorDeg = DECIDEGREES_TO_DEGREES(angleTarget - attitude.raw[axis]);
     // Accumulate the integral error
-    pidState->angleErrorIntegral += angleErrorDeg * dT;
+    //pidState->angleErrorIntegral += angleErrorDeg * dT;
 
     // Soaring mode deadband inactive if pitch/roll stick not centered to allow RC stick adjustment
     if (FLIGHT_MODE(SOARING_MODE) && axis == FD_PITCH && calculateRollPitchCenterStatus() == CENTERED) {
@@ -653,13 +655,15 @@ static void pidLevel(const float angleTarget, pidState_t *pidState, flight_dynam
     }
 
     // Constrain the integral error to prevent windup
+    //float integralLimit = currentControlRateProfile->stabilized.rates[pidState->axis] * 10.0f;
+    //pidState->angleErrorIntegral = constrainf(pidState->angleErrorIntegral, -integralLimit, integralLimit);
     //NOTE this may be a dumb limit since it's based on the rate limit.
     //stabilized.rates[axis] is the rate limit for the axis controlled by roll_rate/pitch_rate in the CLI,
     //or the Stabilized Rates section of the configurator.
-    float integralLimit = currentControlRateProfile->stabilized.rates[axis] * 10.0f;
+    //float integralLimit = currentControlRateProfile->stabilized.rates[axis] * 10.0f;
     
     //added logic elsewhere to reset the i term when the other iterms are reset.  Maybe that was an issue?
-    pidState->angleErrorIntegral = constrainf(pidState->angleErrorIntegral, -integralLimit, integralLimit);
+    //pidState->angleErrorIntegral = constrainf(pidState->angleErrorIntegral, -integralLimit, integralLimit);
     float angleRateTarget = constrainf(
         angleErrorDeg * (pidBank()->pid[PID_LEVEL].P * FP_PID_LEVEL_P_MULTIPLIER) +
         pidState->angleErrorIntegral * (pidBank()->pid[PID_LEVEL].I * FP_PID_LEVEL_I_MULTIPLIER),
@@ -918,6 +922,7 @@ static void FAST_CODE NOINLINE pidApplyMulticopterRateController(pidState_t *pid
     // Don't grow I-term if motors are at their limit
     applyItermLimiting(pidState);
 
+    //Could also apply logic to switch to different output here.
     axisPID[pidState->axis] = newOutputLimited;
 
 #ifdef USE_BLACKBOX
@@ -967,6 +972,52 @@ static uint8_t getHeadingHoldState(void)
     }
 
     return HEADING_HOLD_UPDATE_HEADING;
+}
+
+//Customer MC controller below
+static void FAST_CODE NOINLINE pidApplyJKController(pidState_t *pidState, float dT, float dT_inv)
+{
+
+    const float angleTarget = getFlightAxisAngleOverride(pidState->axis, computePidLevelTarget(pidState->axis));
+    //const float rateTarget = getFlightAxisRateOverride(pidState->axis, pidState->rateTarget);
+
+    const float angleErrorDeg = DECIDEGREES_TO_DEGREES(angleTarget - attitude.raw[pidState->axis]);
+    // Accumulate the integral error
+    pidState->angleErrorIntegral += angleErrorDeg * dT;
+    
+    // PIDLEVEL.D is filter cutoff frequency (Hz). Practical values of filtering frequency is 5-10 Hz
+    //pidState->angleErrorIntegral = pt1FilterApply4(&pidState->angleIntegralFilterState, pidState->angleErrorIntegral, 10, dT);
+    
+    // Constrain the integral error to prevent windup
+    float integralLimit = 250.0f;
+    pidState->angleErrorIntegral = constrainf(pidState->angleErrorIntegral, -integralLimit, integralLimit);
+
+    const float angleErrorDerivative = pidState->gyroRate;
+
+    const float newPTerm = pidState->kP * angleErrorDeg * 5.0f;
+    const float newITerm = pidState->kI * pidState->angleErrorIntegral * 100.0f; // probably need to bump this multiplier more, but test with current 255
+    const float newDTerm = pidState->kD * angleErrorDerivative * 100.0f;  //can't tell if mechanical or code, but there's a 15hz oscillation on the roll axis
+    UNUSED(dT_inv);
+    
+    const float newOutput = newPTerm + newITerm - newDTerm;
+
+    //apply limiting
+    const uint16_t limit = getPidSumLimit(pidState->axis);  //400 or 500 seems to be hard coded elsewhere?
+    const float newOutputLimited = constrainf(newOutput, -limit, +limit);
+
+    //Could also apply logic to switch to different output here.
+    axisPID[pidState->axis] = newOutputLimited;
+
+#ifdef USE_BLACKBOX
+    axisPID_P[pidState->axis] = newPTerm;
+    axisPID_I[pidState->axis] = newITerm;
+    axisPID_D[pidState->axis] = newDTerm;
+    axisPID_F[pidState->axis] = 0.0f;
+    axisPID_Setpoint[pidState->axis] = angleTarget;
+#endif
+
+    //pidState->previousRateTarget = rateTarget;
+    pidState->previousRateGyro = pidState->gyroRate;
 }
 
 /*
@@ -1258,7 +1309,7 @@ void FAST_CODE pidController(float dT)
             }
 
             // Apply the Level PID controller
-            pidLevel(angleTarget, &pidState[axis], axis, horizonRateMagnitude, dT);
+            //pidLevel(angleTarget, &pidState[axis], axis, horizonRateMagnitude, dT);
             canUseFpvCameraMix = false;     // FPVANGLEMIX is incompatible with ANGLE/HORIZON
         } else {
             restartAngleHoldMode = true;
@@ -1289,7 +1340,14 @@ void FAST_CODE pidController(float dT)
         checkItermLimitingActive(&pidState[axis]);
         checkItermFreezingActive(&pidState[axis], axis);
 
-        pidControllerApplyFn(&pidState[axis], dT, dT_inv);
+        //temporarily now calls JKcontroller - simple angle mode
+        pidControllerApplyFn(&pidState[axis], dT, dT_inv);  //could apply a check to do this or implement my own function for Inverted Pendulum mode.
+        if (axis < 2) {
+            pidApplyJKController(&pidState[axis], dT, dT_inv);
+        }
+        else{
+            pidControllerApplyFn(&pidState[axis], dT, dT_inv);
+        }
     }
 }
 
@@ -1370,10 +1428,12 @@ void pidInit(void)
 
     assignFilterApplyFn(pidProfile()->dterm_lpf_type, pidProfile()->dterm_lpf_hz, &dTermLpfFilterApplyFn);
 
+    //code below assigns pointer to PID controller.  Don't think I can use unless inav lets me convert types dynamically.  Unless I can fly that way, too...
     if (usedPidControllerType == PID_TYPE_PIFF) {
         pidControllerApplyFn = pidApplyFixedWingRateController;
     } else if (usedPidControllerType == PID_TYPE_PID) {
         pidControllerApplyFn = pidApplyMulticopterRateController;
+        //pidControllerApplyFn = pidApplyJKController;
     } else {
         pidControllerApplyFn = nullRateController;
     }
@@ -1474,3 +1534,4 @@ uint16_t getPidSumLimit(const flight_dynamics_index_t axis) {
         return 500;
     }
 }
+
